@@ -1,0 +1,50 @@
+use anchor_lang::prelude::*;
+use crate::constants::EventTier;
+
+/// Stores the global authority and event counter
+#[account]
+pub struct GlobalState {
+    pub authority: Pubkey, // Admin or protocol-level owner
+    pub last_event_id: u64,
+    pub bump: u8,
+}
+
+impl GlobalState {
+    pub const INIT_SPACE: usize = 8 + // discriminator
+        32 + // authority
+        8 +  // last_event_id
+        1;   // bump
+}
+
+/// Represents a single event created by an organizer
+#[account]
+pub struct Event {
+    pub authority: Pubkey,       // Wallet that created the event
+    pub event_id: u64,           // Globally unique event ID
+    pub name: String,            // Event title
+    pub tier: EventTier,         // Tier (VIP / General / Backstage etc.)
+    pub timestamp: i64,          // Scheduled time
+    pub max_tickets: u32,        // Capacity
+    pub minted_count: u32,       // Count of tickets minted
+    pub uri: String,             // IPFS metadata URI
+    pub bump: u8,                // PDA bump
+}
+
+impl Event {
+    /// Returns number of tickets still available for minting
+    pub fn remaining_tickets(&self) -> u32 {
+        self.max_tickets.saturating_sub(self.minted_count)
+    }
+
+    /// Calculate account space to avoid magic numbers
+    pub const INIT_SPACE: usize = 8 + // discriminator
+        32 + // authority
+        8 +  // event_id
+        4 + 64 + // name: size prefix + max 64 bytes
+        1 +  // tier: enum as u8
+        8 +  // timestamp
+        4 + // max_tickets
+        4 + // minted_count
+        4 + 256 + // uri: size prefix + 256 bytes
+        1;   // bump
+}
