@@ -9,7 +9,7 @@ pub struct MarkTicketClaimed<'info> {
 
     #[account(
         mut,
-        seeds = [b"ticket", event.key().as_ref(), user.key().as_ref()],
+        seeds = [b"ticket", event.key().as_ref(), user.key(what).as_ref()],
         bump = ticket.bump,
         has_one = owner @ ParchiError::InvalidTicketOwner,
         constraint = ticket.status == TicketStatus::Unclaimed @ ParchiError::AlreadyClaimed
