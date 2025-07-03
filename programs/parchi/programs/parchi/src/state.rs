@@ -37,14 +37,15 @@ impl Event {
     }
 
     /// Calculate account space to avoid magic numbers
-    pub const INIT_SPACE: usize = 8 + // discriminator
+   pub const INIT_SPACE: usize =  // total space = discriminator + fields
+        8 + // discriminator
         32 + // authority
-        8 +  // event_id
-        4 + 64 + // name: size prefix + max 64 bytes
-        1 +  // tier: enum as u8
-        8 +  // timestamp
+        8 + // event_id
+        4 + MAX_EVENT_NAME_LEN + // name (String = 4 bytes length prefix + data)
+        1 + // tier (enum as u8)
+        8 + // timestamp
         4 + // max_tickets
         4 + // minted_count
-        4 + 256 + // uri: size prefix + 256 bytes
-        1;   // bump
+        4 + MAX_METADATA_URI_LEN + // uri
+        1; // bump
 }

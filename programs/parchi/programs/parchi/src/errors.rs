@@ -28,4 +28,13 @@ pub enum ParchiError {
 
     #[msg("Invalid input.")]
     InvalidInput,
+    
+    #[msg("Event name too long.")]
+    NameTooLong,
+
+    #[msg("Metadata URI too long.")]
+    UriTooLong,
+
+    #[msg("Overflow while incrementing event ID.")]
+    Overflow,
 }

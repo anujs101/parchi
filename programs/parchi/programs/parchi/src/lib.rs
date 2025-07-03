@@ -14,12 +14,18 @@ declare_id!("BTA3ZKyCjvfQq2gBxitcHMwPUAS5WHuDGMyEgMnBLYGj");
 pub mod parchi {
     use super::*;
 
+     pub fn init_event(
+        ctx: Context<InitEvent>,
+        name: String,
+        tier: EventTier,
+        timestamp: i64,
+        max_tickets: u32,
+        uri: String,
+    ) -> Result<()> {
+        init_event::handler(ctx, name, tier, timestamp, max_tickets, uri)
+    }
     pub fn init_global_state(ctx: Context<InitGlobalState>) -> Result<()> {
         init_global_state::handler(ctx)
-    }
-
-    pub fn init_event(ctx: Context<InitEvent>, args: InitEventArgs) -> Result<()> {
-        init_event::handler(ctx, args)
     }
 
     pub fn update_event(ctx: Context<UpdateEvent>, args: UpdateEventArgs) -> Result<()> {
