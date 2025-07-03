@@ -3,18 +3,18 @@ use anchor_lang::prelude::*;
 /// Event access tier – useful for defining pricing or benefits
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
 pub enum EventTier {
-    General=0,
+    Standard=0,
     VIP=1,
-    Backstage=2,
+    Premium=2,
 }
 
 impl EventTier {
     /// Convert tier to a human-readable string (optional)
     pub fn as_str(&self) -> &'static str {
         match self {
-            EventTier::General => "General",
+            EventTier::Standard => "Standard",
             EventTier::VIP => "VIP",
-            EventTier::Backstage => "Backstage",
+            EventTier::Premium => "Premium",
         }
     }
 }

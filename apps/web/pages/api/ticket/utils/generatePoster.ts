@@ -7,7 +7,7 @@ type GeneratePosterParams = {
   eventName: string;
   eventDate: string;
   location: string;
-  tier: 'VIP' | 'General' | 'Backstage';
+  tier: 'VIP' | 'Standard' | 'Premium';
 };
 
 export async function generatePoster({

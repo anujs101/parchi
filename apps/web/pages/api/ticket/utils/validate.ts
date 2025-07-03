@@ -1,31 +1,42 @@
 // apps/web/app/api/ticket/utils/validate.ts
 
-import { z } from 'zod';
+import { z, ZodError } from 'zod';
 
-// Define Zod schema for the expected request shape
-const MintTicketSchema = z.object({
+// ✅ Define schema
+export const MintTicketSchema = z.object({
   eventId: z.string().min(1, 'Event ID is required'),
-    userWallet: z.string().refine(val =>
+  userWallet: z.string().refine(val =>
     val.length === 44 || val.startsWith('0x'),
     'Invalid wallet format (expected Solana address or EVM)'
-    ), // Phantom/Solana pubkey
+  ),
   eventName: z.string().min(1, 'Event name is required'),
-  eventDate: z.string().min(1, 'Event date is required'), // ISO format expected
+  eventDate: z.string().min(1, 'Event date is required'),
   location: z.string().min(1, 'Location is required'),
   tier: z.enum(['VIP', 'Standard', 'Premium']),
 });
 
-// Export type-safe result parser
-export function validateMintRequest(data: unknown) {
+// ✅ Export inferred type
+export type MintTicketInput = z.infer<typeof MintTicketSchema>;
+
+// ✅ Validate + type-safe result
+export function validateMintRequest(data: unknown): {
+  success: true;
+  data: MintTicketInput;
+  error: null;
+} | {
+  success: false;
+  data: null;
+  error: ReturnType<ZodError<MintTicketInput>['format']>;
+} {
   const result = MintTicketSchema.safeParse(data);
+
+  if (result.success) {
+    return { success: true, data: result.data, error: null };
+  }
+
   return {
-    success: result.success,
-    data: result.success ? result.data : null,
-    error: result.success ? null : result.error.format(),
+    success: false,
+    data: null,
+    error: (result.error as ZodError<MintTicketInput>).format()
   };
 }
-
-// Optionally export schema if needed elsewhere
-export type MintValidationResult =
-  | { success: true; data: MintTicketInput; error: null }
-  | { success: false; data: null; error: ReturnType<typeof MintTicketSchema.safeParse>['error']['format'] };
