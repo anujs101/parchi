@@ -19,6 +19,12 @@ impl EventTier {
     }
 }
 
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+pub enum TicketStatus {
+    Unclaimed,
+    Claimed,
+}
+
 /// Global seeds for PDAs
 pub const GLOBAL_STATE_SEED: &[u8] = b"global-state";
 pub const EVENT_SEED: &[u8] = b"event";

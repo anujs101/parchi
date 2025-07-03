@@ -28,7 +28,7 @@ pub enum ParchiError {
 
     #[msg("Invalid input.")]
     InvalidInput,
-    
+
     #[msg("Event name too long.")]
     NameTooLong,
 
@@ -37,4 +37,13 @@ pub enum ParchiError {
 
     #[msg("Overflow while incrementing event ID.")]
     Overflow,
+
+    #[msg("Maximum number of tickets for this event has been reached.")]
+    MaxTicketLimitReached,
+
+    #[msg("Ticket PDA bump not found.")]
+    BumpNotFound,
+
+    #[msg("Math operation overflowed.")]
+    MathOverflow,
 }

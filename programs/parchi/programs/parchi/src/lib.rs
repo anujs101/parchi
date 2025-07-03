@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
-
+mod instructions;
+pub use instructions::*;
 pub mod context;
-pub mod instructions;
 pub mod state;
 pub mod constants;
 pub mod errors;
@@ -32,7 +32,13 @@ pub mod parchi {
         update_event::handler(ctx, args)
     }
 
-    pub fn mint_ticket(ctx: Context<MintTicket>, args: MintTicketArgs) -> Result<()> {
-        mint_ticket::handler(ctx, args)
+    pub fn mark_ticket_claimed(ctx: Context<MarkTicketClaimed>) -> Result<()> {
+    instructions::mark_ticket_claimed::handler(ctx)
     }
+
+}
+#[event]
+pub struct TicketMinted {
+    pub user: Pubkey,
+    pub event: Pubkey,
 }
