@@ -191,7 +191,6 @@ export function createTicketMetadata(
       { trait_type: "Event Date", value: eventDate.toISOString().split('T')[0] },
       { trait_type: "Event Name", value: eventName },
       ...(venue ? [{ trait_type: "Venue", value: venue }] : []),
-      { trait_type: "Status", value: "Valid" },
       { trait_type: "Blockchain", value: "Solana" },
       { trait_type: "Standard", value: "Metaplex Core" }
     ],

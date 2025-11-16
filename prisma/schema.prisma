@@ -103,6 +103,8 @@ model GateVerification {
   verifiedAt      DateTime?
   location        String?
   notes           String?
+ signerPubkey    String?           // wallet that signed at verification time
+ meta            Json?             // arbitrary JSON for challengeJwt, signature, gateId, etc.
   createdAt       DateTime          @default(now())
 
   // Relations
