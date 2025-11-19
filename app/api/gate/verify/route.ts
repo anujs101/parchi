@@ -9,7 +9,7 @@ import {
   walletOwnsMint,
 } from '@/lib/gate/gateHelpers';
 
-const SOLANA_RPC = process.env.SOLANA_RPC_URL ?? 'https://api.mainnet-beta.solana.com';
+const SOLANA_RPC = process.env.SOLANA_RPC_URL ?? 'https://api.devnet.solana.com';
 
 /**
  * POST /api/gate/verify

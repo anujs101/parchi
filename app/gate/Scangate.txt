@@ -179,66 +179,24 @@ export default function ScanPage() {
 
   // --- WalletConnect helpers ---
 async function initWalletConnectClient() {
-  console.log('WALLETCONNECT_PROJECT_ID:', WALLETCONNECT_PROJECT_ID);
   if (!WALLETCONNECT_PROJECT_ID) throw new Error('WalletConnect Project ID not configured');
   if (clientRef.current) return clientRef.current;
-
-  // guard for HMR / double-init
+  // defensive: guard global to avoid repeated init across HMR reloads
   // @ts-ignore
   if ((window as any).__WALLETCONNECT_CLIENT_INITIALIZING) {
+    // wait briefly for that init to finish
     await new Promise((res) => setTimeout(res, 200));
     if (clientRef.current) return clientRef.current;
   }
   // @ts-ignore
   (window as any).__WALLETCONNECT_CLIENT_INITIALIZING = true;
-
   try {
-    // NOTE: add metadata so wallets show your app name (avoid "Unknown app")
-    const client = await SignClient.init({
-      projectId: WALLETCONNECT_PROJECT_ID,
-      metadata: {
-        name: 'Parchi Gate',
-        description: 'Gate Scanner - sign challenges',
-        url: typeof window !== 'undefined' ? window.location.origin : 'https://example.com',
-        icons: [], // optional: add a URL to an icon if you have one
-      },
-    });
-
+    const client = await SignClient.init({ projectId: WALLETCONNECT_PROJECT_ID });
     clientRef.current = client;
-
-    // Basic session cleanup listener (existing)
     client.on?.('session_delete', () => {
       sessionTopicRef.current = null;
       setWcStatus('disconnected');
     });
-
-    // --- Debug listeners (very helpful while debugging pairing/settle) ---
-    // replace the debug listeners block with this:
-    const dbg = (k: string, v?: any) => console.log(`[WC DBG] ${k}`, v);
-client.on?.('session_proposal', (proposal) => console.log('[WC DBG] session_proposal', proposal));
-client.on?.('session_request', (req) => console.log('[WC DBG] session_request', req));
-//client.on?.('session_settle', (session) => console.log('[WC DBG] session_settle', session));
-client.on?.('session_update', (update) => console.log('[WC DBG] session_update', update));
-client.on?.('session_delete', (del) => console.log('[WC DBG] session_delete', del));
-client.on?.('session_event', (ev) => console.log('[WC DBG] session_event', ev));
-client.on?.('session_expire', (exp) => console.log('[WC DBG] session_expire', exp));
-client.on?.('session_ping', (p) => console.log('[WC DBG] session_ping', p));
-
-
-
-    
-    //client.on?.('pairing_create', (p) => dbg('pairing_create', p));
-    //client.on?.('pairing_update', (p) => dbg('pairing_update', p));
-    //client.on?.('pairing_delete', (p) => dbg('pairing_delete', p));
-    client.on?.('session_proposal', (proposal) => dbg('session_proposal', proposal));
-    client.on?.('session_request', (req) => dbg('session_request', req));
-    //client.on?.('session_settle', (session) => dbg('session_settle', session));
-    client.on?.('session_update', (update) => dbg('session_update', update));
-    client.on?.('session_delete', (del) => dbg('session_delete', del));
-    client.on?.('session_ping', (p) => dbg('session_ping', p));
-    client.on?.('session_event', (ev) => dbg('session_event', ev));
-    client.on?.('session_expire', (exp) => dbg('session_expire', exp));
-
     return client;
   } finally {
     // @ts-ignore
@@ -247,246 +205,168 @@ client.on?.('session_ping', (p) => console.log('[WC DBG] session_ping', p));
 }
 
 
-
   // start pairing, request sign, return { signature, pubkey }
   async function startWalletConnectAndSign(messageToSignStr: string) {
-  setBusy(true);
-  setError(null);
-  setSignature(null);
-  setSignerPubkey(null);
-  setWcQrDataUrl(null);
-  setWcStatus('initializing');
+    setBusy(true);
+    setError(null);
+    setSignature(null);
+    setSignerPubkey(null);
+    setWcQrDataUrl(null);
+    setWcStatus('initializing');
 
-  try {
-    const client = await initWalletConnectClient();
-
-    // DEV helper: clear old pairings to avoid stale key usage (only in dev)
     try {
-      const pairings = client.pairing?.getAll?.() ?? [];
-      if (pairings.length) {
-        console.log('[WC DEV] clearing existing pairings:', pairings.map(p => p.topic));
-        for (const p of pairings) {
-          try {
-            // Note: delete(key, reason) per your SignClient types
-            await client.pairing?.delete?.(p.topic, { code: 6000, message: 'dev_clear' });
-            console.log('[WC DEV] pairing deleted', p.topic);
-          } catch (e) {
-            console.warn('[WC DEV] pairing delete failed for', p.topic, e);
+      const client = await initWalletConnectClient();
+      const genesis = await getSolanaGenesisHash();
+      console.log('solana genesisHash from RPC:', genesis);
+      const SOLANA_DEVNET_CAIP = `solana:${genesis}`;
+      console.log('Using CAIP chain:', SOLANA_DEVNET_CAIP);
+
+      const solChain = ensureCaipChain('solana', SOLANA_DEVNET_CAIP); // idempotent
+      const requiredNamespaces = {
+        solana: {
+          methods: ['solana_signMessage'],
+          chains: [solChain],
+          events: [],
+        },
+      };
+        console.log('WalletConnect proposal (requiredNamespaces):', JSON.stringify(requiredNamespaces, null, 2));
+      const { uri, approval } = await client.connect({ requiredNamespaces });
+
+      if (!uri) throw new Error('WalletConnect pairing URI not returned');
+      setWcStatus('paired_waiting');
+
+
+      // render QR
+      const dataUrl = await QRCode.toDataURL(uri);
+      setWcQrDataUrl(dataUrl);
+
+      // approval timeout to avoid indefinite wait
+      const APPROVAL_TIMEOUT_MS = 90_000;
+      const approvalPromise = approval();
+      const timeoutPromise = new Promise((_res, rej) =>
+        setTimeout(() => rej(new Error('wallet_approval_timeout')), APPROVAL_TIMEOUT_MS)
+      );
+
+      // wait once and handle errors cleanly
+      let session: SessionTypes.Struct;
+      try {
+        session = await Promise.race([approvalPromise, timeoutPromise]) as SessionTypes.Struct;
+      } catch (err) {
+        console.error('approval error / timeout:', err);
+        throw err; // bubble up so your outer catch shows the actual reason
+      }
+
+      console.log('session.namespaces:', JSON.stringify(session.namespaces, null, 2));
+      const acceptedChains = (session.namespaces?.solana?.chains ?? []) as string[];
+      // defensive check: did wallet accept our chain?
+      console.log('acceptedChains by wallet:', acceptedChains);
+      if (!acceptedChains.includes(solChain)) {
+        // show the wallet's accepted chains in UI and throw
+        const accepted = acceptedChains.length ? acceptedChains.join(', ') : 'none';
+        throw new Error(`Wallet did not accept requested chain ${solChain}. Wallet accepted: ${accepted}`);
+      }
+
+      
+      
+      sessionTopicRef.current = session.topic;
+      setWcStatus('connected');
+
+              // prepare two payloads to try
+        const messageBytes = Array.from(new TextEncoder().encode(messageToSignStr));
+        const messageBase64 = btoa(messageToSignStr);
+
+        // first try bytes (array)
+        let rawRes: unknown;
+        try {
+          rawRes = await client.request({
+            topic: session.topic,
+            chainId: solChain,
+            request: { method: 'solana_signMessage', params: { message: messageBytes } },
+          } as any);
+          console.log('sign with bytes succeeded');
+        } catch (err1) {
+          console.warn('sign with bytes failed, trying base64', err1);
+          // try base64 fallback
+          rawRes = await client.request({
+            topic: session.topic,
+            chainId: solChain,
+            request: { method: 'solana_signMessage', params: { message: messageBase64 } },
+          } as any);
+          console.log('sign with base64 succeeded');
+        }
+
+
+      setWcStatus('requesting_signature');
+
+      //const rawRes: unknown = await client.request(request as any);
+
+      // parse response (Phantom priority)
+      let sig: string | null = null;
+      let pubkey: string | null = null;
+
+      const isObject = (v: unknown): v is Record<string, unknown> =>
+        typeof v === 'object' && v !== null;
+
+      if (isObject(rawRes) && typeof (rawRes as any).signature === 'string') {
+        sig = (rawRes as any).signature;
+        if (typeof (rawRes as any).pubkey === 'string') pubkey = (rawRes as any).pubkey;
+      }
+
+      if (!sig) {
+        if (typeof rawRes === 'string') sig = rawRes;
+        else if (Array.isArray(rawRes)) {
+          if (typeof rawRes[0] === 'string') sig = rawRes[0];
+          if (typeof rawRes[1] === 'string') pubkey = rawRes[1];
+        } else if (isObject(rawRes)) {
+          if ('result' in rawRes) {
+            const r = (rawRes as any).result;
+            if (typeof r === 'string') sig = r;
+            else if (isObject(r) && typeof r.signature === 'string') {
+              sig = r.signature;
+              if (typeof r.pubkey === 'string') pubkey = r.pubkey;
+            } else if (Array.isArray(r) && typeof r[0] === 'string') {
+              sig = r[0];
+              if (typeof r[1] === 'string') pubkey = r[1];
+            }
+          } else if ('signed' in rawRes && typeof (rawRes as any).signed === 'string') {
+            sig = (rawRes as any).signed;
+            if (typeof (rawRes as any).pubkey === 'string') pubkey = (rawRes as any).pubkey;
+          } else if ('signature' in rawRes && typeof (rawRes as any).signature === 'object') {
+            const s = (rawRes as any).signature;
+            if (typeof s === 'string') sig = s;
           }
         }
       }
-    } catch (clearErr) {
-      console.warn('[WC DEV] pairing clear err', clearErr);
-    }
+      console.log('sign result parsed:', { sig, pubkey });
+      if (!sig) {
+        console.warn('Wallet sign returned unexpected shape:', rawRes);
+        throw new Error('no_signature_in_response');
+      }
 
+      setSignature(sig);
+      if (pubkey) setSignerPubkey(pubkey);
 
+      setWcStatus('signed');
 
-    // compute devnet genesis CAIP
-    const genesis = await getSolanaGenesisHash();
-    console.log('solana genesisHash from RPC:', genesis);
-    const SOLANA_DEVNET_CAIP = `solana:${genesis}`;
-    console.log('Using CAIP chain:', SOLANA_DEVNET_CAIP);
+      // disconnect session (single-use)
+      try {
+        await client.disconnect({ topic: session.topic, reason: { code: 6000, message: 'single-use finished' } });
+        sessionTopicRef.current = null;
+        setWcStatus('disconnected');
+      } catch (e) {
+        console.warn('wc disconnect error after sign', e);
+      }
 
-    // include friendly fallback "solana:devnet" for wallets that accept that label
-    const solChain = ensureCaipChain('solana', SOLANA_DEVNET_CAIP);
-    const fallbackChain = 'solana:devnet';
-    const requiredNamespaces = {
-      solana: {
-        methods: ['solana_signMessage'],
-        chains: [solChain, fallbackChain],
-        events: [],
-      },
-    };
-    console.log('WalletConnect proposal (requiredNamespaces):', JSON.stringify(requiredNamespaces, null, 2));
-
-    const { uri, approval } = await client.connect({ requiredNamespaces });
-
-    if (!uri) throw new Error('WalletConnect pairing URI not returned');
-    setWcStatus('paired_waiting');
-
-    // render QR
-    const dataUrl = await QRCode.toDataURL(uri);
-    setWcQrDataUrl(dataUrl);
-
-    // approval timeout (increase while debugging)
-    const APPROVAL_TIMEOUT_MS = 180_000; // 3 minutes while debugging
-    const approvalPromise = approval();
-    const timeoutPromise = new Promise((_res, rej) =>
-      setTimeout(() => rej(new Error('wallet_approval_timeout')), APPROVAL_TIMEOUT_MS)
-    );
-
-    // wait for wallet to accept / settle
-    let session: SessionTypes.Struct;
-    try {
-      session = await Promise.race([approvalPromise, timeoutPromise]) as SessionTypes.Struct;
-    } catch (err) {
-      console.error('approval error / timeout:', err);
-      throw err;
-    }
-
-    console.log('approval returned session:', session);
-    console.log('session.namespaces:', JSON.stringify(session.namespaces, null, 2));
-
-    // defensive: check accepted chains
-    const acceptedChains = (session.namespaces?.solana?.chains ?? []) as string[];
-    console.log('acceptedChains by wallet:', acceptedChains);
-    if (!acceptedChains.includes(solChain) && !acceptedChains.includes(fallbackChain)) {
-      const accepted = acceptedChains.length ? acceptedChains.join(', ') : 'none';
+      return { signature: sig, pubkey: pubkey ?? null };
+    } catch (err: any) {
+      console.error('WalletConnect error', err);
+      setError(err?.message ?? 'walletconnect_error');
       setWcStatus('error');
-      setError(`Wallet did not accept requested chain. Wallet accepted: ${accepted}. Please enable Devnet or use a wallet that supports Devnet (Phantom recommended).`);
-      throw new Error('wallet_no_devnet_support');
+      throw err;
+    } finally {
+      setBusy(false);
     }
-
-    sessionTopicRef.current = session.topic;
-    setWcStatus('connected');
-
-    // ENCODE message properly (utf8 bytes) and also prepare base64 fallback
-  // add bs58 import at top: import bs58 from 'bs58'
-
-// inside startWalletConnectAndSign, after you've validated session and have `session.topic` and `solChain`:
-
-// prepare encodings (use a Uint8Array as canonical source)
-const encoder = new TextEncoder();
-const u8 = encoder.encode(messageToSignStr);               // Uint8Array
-const messageBytes = Array.from(u8);                       // Array<number> -> WalletConnect-friendly
-const messageBase64 = typeof window !== 'undefined'
-  ? btoa(String.fromCharCode(...u8))                       // base64 from bytes
-  : Buffer.from(u8).toString('base64');                    // server-side fallback
-const messageBase58 = bs58.encode(u8);                     // bs58 string
-
-console.log('Prepared message encodings:', {
-  len: u8.length,
-  bytesPreview: messageBytes.slice(0, 10),
-  base64Preview: messageBase64.slice(0, 20),
-  base58Preview: messageBase58.slice(0, 20),
-});
-
-// We'll try variants in order and capture the raw wallet response
-let rawRes: unknown;
-let lastErr: any = null;
-
-// 1) Try bytes (Array<number>)
-try {
-  console.log('Request: solana_signMessage with bytes array');
-  rawRes = await client.request({
-    topic: session.topic,
-    chainId: solChain,
-    request: { method: 'solana_signMessage', params: { message: messageBytes } },
-  } as any);
-  console.log('sign with bytes succeeded', rawRes);
-} catch (err) {
-  lastErr = err;
-  console.warn('sign with bytes failed:', err);
-}
-
-// 2) Try base64 (if bytes failed)
-if (!rawRes) {
-  try {
-    console.log('Request: solana_signMessage with base64');
-    rawRes = await client.request({
-      topic: session.topic,
-      chainId: solChain,
-      request: { method: 'solana_signMessage', params: { message: messageBase64 } },
-    } as any);
-    console.log('sign with base64 succeeded', rawRes);
-  } catch (err) {
-    lastErr = err;
-    console.warn('sign with base64 failed:', err);
   }
-}
-
-// 3) Try base58 (if previous failed)
-if (!rawRes) {
-  try {
-    console.log('Request: solana_signMessage with base58');
-    rawRes = await client.request({
-      topic: session.topic,
-      chainId: solChain,
-      request: { method: 'solana_signMessage', params: { message: messageBase58 } },
-    } as any);
-    console.log('sign with base58 succeeded', rawRes);
-  } catch (err) {
-    lastErr = err;
-    console.warn('sign with base58 failed:', err);
-  }
-}
-
-if (!rawRes) {
-  // nothing worked — throw the last error (or custom)
-  throw lastErr ?? new Error('All sign variants failed');
-}
-
-
-    setWcStatus('requesting_signature');
-
-    // parse response like before
-    let sig: string | null = null;
-    let pubkey: string | null = null;
-    const isObject = (v: unknown): v is Record<string, unknown> =>
-      typeof v === 'object' && v !== null;
-
-    if (isObject(rawRes) && typeof (rawRes as any).signature === 'string') {
-      sig = (rawRes as any).signature;
-      if (typeof (rawRes as any).pubkey === 'string') pubkey = (rawRes as any).pubkey;
-    }
-
-    if (!sig) {
-      if (typeof rawRes === 'string') sig = rawRes;
-      else if (Array.isArray(rawRes)) {
-        if (typeof rawRes[0] === 'string') sig = rawRes[0];
-        if (typeof rawRes[1] === 'string') pubkey = rawRes[1];
-      } else if (isObject(rawRes)) {
-        if ('result' in rawRes) {
-          const r = (rawRes as any).result;
-          if (typeof r === 'string') sig = r;
-          else if (isObject(r) && typeof r.signature === 'string') {
-            sig = r.signature;
-            if (typeof r.pubkey === 'string') pubkey = r.pubkey;
-          } else if (Array.isArray(r) && typeof r[0] === 'string') {
-            sig = r[0];
-            if (typeof r[1] === 'string') pubkey = r[1];
-          }
-        } else if ('signed' in rawRes && typeof (rawRes as any).signed === 'string') {
-          sig = (rawRes as any).signed;
-          if (typeof (rawRes as any).pubkey === 'string') pubkey = (rawRes as any).pubkey;
-        } else if ('signature' in rawRes && typeof (rawRes as any).signature === 'object') {
-          const s = (rawRes as any).signature;
-          if (typeof s === 'string') sig = s;
-        }
-      }
-    }
-
-    console.log('sign result parsed:', { sig, pubkey });
-    if (!sig) {
-      console.warn('Wallet sign returned unexpected shape:', rawRes);
-      throw new Error('no_signature_in_response');
-    }
-
-    setSignature(sig);
-    if (pubkey) setSignerPubkey(pubkey);
-
-    setWcStatus('signed');
-
-    // disconnect single-use
-    try {
-      await client.disconnect({ topic: session.topic, reason: { code: 6000, message: 'single-use finished' } });
-      sessionTopicRef.current = null;
-      setWcStatus('disconnected');
-    } catch (e) {
-      console.warn('wc disconnect error after sign', e);
-    }
-
-    return { signature: sig, pubkey: pubkey ?? null };
-  } catch (err: any) {
-    console.error('WalletConnect error', err);
-    setError(err?.message ?? 'walletconnect_error');
-    setWcStatus('error');
-    throw err;
-  } finally {
-    setBusy(false);
-  }
-}
-
 // utils/base64url.ts (or inline)
 function base64UrlToUtf8(base64url: string): string {
   // turn base64url into base64
