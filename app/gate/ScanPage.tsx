@@ -2,52 +2,23 @@
 'use client';
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import SignClient from '@walletconnect/sign-client';
-import type { SessionTypes } from "@walletconnect/types";
-import QRCode from 'qrcode';
-import bs58 from 'bs58';
-
 import QRScanner from '@/components/qr/QRScanner';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { WalletConnectButton } from '@/components/wallet/WalletConnectButton';
 import { CheckCircle, AlertCircle, QrCode } from 'lucide-react';
 
 type ScanResponse = {
   ok: boolean;
-  challengeJwt?: string;
-  messageToSign?: string;
-  expiresInSeconds?: number;
+  // the server should return whatever ticket / verification identifiers it uses
+  ticketId?: string | null;
   verificationId?: string | null;
-  ticketId?: string;
   eventId?: string | null;
-  error?: string;
   details?: string;
+  error?: string;
+  // optional: a human message for display
+  message?: string;
 };
-
-const WALLETCONNECT_PROJECT_ID = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID ?? '';
-
-// normalize incoming chain id so we don't accidentally double-prefix
-function ensureCaipChain(namespace: string, chainLike: string) {
-  const pref = `${namespace}:`;
-  if (!chainLike) return `${namespace}:`; // defensive
-  // if already starts with the namespace (e.g. "solana:...") return as-is
-  if (chainLike.startsWith(pref)) return chainLike;
-  // if the value already contains namespace twice (very defensive), strip extras
-  const stripped = chainLike.replace(new RegExp(`^(?:${namespace}:)+`), '');
-  return `${namespace}:${stripped}`;
-}
-// get devnet genesis (run once at runtime)
-async function getSolanaGenesisHash(rpcUrl = 'https://api.devnet.solana.com') {
-  const r = await fetch(rpcUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getGenesisHash' }),
-  });
-  const j = await r.json();
-  return j?.result; // example: "GH7ome3Ei..." (whatever the node returns)
-}
 
 export default function ScanPage() {
   // UI state
@@ -56,62 +27,66 @@ export default function ScanPage() {
   const [message, setMessage] = useState<string>('Scan a ticket QR to verify');
   const [manualText, setManualText] = useState<string>('');
 
-  // Gate flow state
-  const [challengeJwt, setChallengeJwt] = useState<string | null>(null);
-  const [messageToSign, setMessageToSign] = useState<string | null>(null);
-  const [expiresIn, setExpiresIn] = useState<number | null>(null);
+  // Gate flow state (keeps ticket / verification ids from server)
   const [verificationId, setVerificationId] = useState<string | null>(null);
   const [ticketId, setTicketId] = useState<string | null>(null);
-
-  // WalletConnect UI
-  const [wcQrDataUrl, setWcQrDataUrl] = useState<string | null>(null);
-  const [wcStatus, setWcStatus] = useState<string | null>(null);
-
-  // Signature state
-  const [signature, setSignature] = useState<string | null>(null);
-  const [signerPubkey, setSignerPubkey] = useState<string | null>(null);
+  const [eventId, setEventId] = useState<string | null>(null);
 
   // Busy / error states
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // WalletConnect client refs
-  const clientRef = useRef<SignClient | null>(null);
-  const sessionTopicRef = useRef<string | null>(null);
+  // small local storage for verify result to display
+  const [verifyResult, setVerifyResult] = useState<any>(null);
 
+  // constants (adjust as needed)
   const STAFF_ID = 'staff-1';
   const GATE_ID = 'gate-1';
 
-  // cleanup on unmount
+  // cleanup on unmount (no WalletConnect references any more)
   useEffect(() => {
     return () => {
-      (async () => {
-        try {
-          const client = clientRef.current;
-          const topic = sessionTopicRef.current;
-          if (client && topic) {
-            try {
-              await client.disconnect({
-                topic,
-                reason: { code: 6000, message: 'component_unmount' },
-              });
-            } catch (e) {
-              // ignore
-            }
-          }
-        } catch {}
-        clientRef.current = null;
-        sessionTopicRef.current = null;
-      })();
+      // nothing to cleanup now
     };
   }, []);
+
+  // helper: decode base64url used in your QR encoding (kept compatible with existing generator)
+  function base64UrlToUtf8(base64url: string): string {
+    let b64 = base64url.replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4) b64 += '=';
+    const bin = atob(b64);
+    const bytes = Uint8Array.from(bin.split('').map(ch => ch.charCodeAt(0)));
+    const decoder = new TextDecoder('utf-8');
+    return decoder.decode(bytes);
+  }
+
+  // Accepts "parchi:<base64url>" or raw JSON / other strings
+  function normalizeQrStringForServer(raw: string): string {
+    const s = raw.trim();
+    if (s.startsWith('parchi:')) {
+      const payload = s.slice('parchi:'.length);
+      try {
+        const jsonText = base64UrlToUtf8(payload);
+        const obj = JSON.parse(jsonText);
+        const mapped = {
+          m: obj.a ?? obj.m ?? obj.mintPubkey ?? null,
+          e: obj.e ?? obj.eventId ?? null,
+          t: obj.t ?? obj.ticketId ?? null,
+          ts: obj.ts ?? null,
+          c: obj.c ?? null,
+        };
+        return JSON.stringify(mapped);
+      } catch (err) {
+        return s;
+      }
+    }
+    return s;
+  }
 
   // --- API: scan ---
   const callScanApi = useCallback(async (qrString: string) => {
     setBusy(true);
     setError(null);
-    setSignature(null);
-    setSignerPubkey(null);
     setVerifyResult(null);
 
     try {
@@ -123,30 +98,29 @@ export default function ScanPage() {
       const data: ScanResponse = await res.json();
       if (!data.ok) throw new Error(data.error || data.details || 'scan_failed');
 
-      setChallengeJwt(data.challengeJwt ?? null);
-      setMessageToSign(data.messageToSign ?? null);
-      setExpiresIn(data.expiresInSeconds ?? null);
-      setVerificationId(data.verificationId ?? null);
+      // UI-friendly fields
       setTicketId(data.ticketId ?? null);
+      setVerificationId(data.verificationId ?? null);
+      setEventId(data.eventId ?? null);
+      setMessage(data.message ?? 'Scan accepted — verifying automatically');
 
       return data;
     } catch (err: any) {
       console.error('scan api error', err);
       setError(err?.message ?? 'scan_error');
+      setMessage(err?.message ?? 'Scan failed');
       throw err;
     } finally {
       setBusy(false);
     }
   }, []);
 
-  // --- API: verify ---
+  // --- API: verify (no signature required) ---
   const callVerifyApi = useCallback(async (payload: {
-    challengeJwt: string;
-    signatureBase58: string;
-    signerPubkey?: string | null;
+    verificationId?: string | null;
+    ticketId?: string | null;
     staffId?: string;
     gateId?: string;
-    verificationId?: string | null;
   }) => {
     setBusy(true);
     setError(null);
@@ -173,439 +147,38 @@ export default function ScanPage() {
     }
   }, []);
 
-  // small local storage for verify result to display
-  const [verifyResult, setVerifyResult] = useState<any>(null);
-  
-
-  // --- WalletConnect helpers ---
-async function initWalletConnectClient() {
-  console.log('WALLETCONNECT_PROJECT_ID:', WALLETCONNECT_PROJECT_ID);
-  if (!WALLETCONNECT_PROJECT_ID) throw new Error('WalletConnect Project ID not configured');
-  if (clientRef.current) return clientRef.current;
-
-  // guard for HMR / double-init
-  // @ts-ignore
-  if ((window as any).__WALLETCONNECT_CLIENT_INITIALIZING) {
-    await new Promise((res) => setTimeout(res, 200));
-    if (clientRef.current) return clientRef.current;
-  }
-  // @ts-ignore
-  (window as any).__WALLETCONNECT_CLIENT_INITIALIZING = true;
-
-  try {
-    // NOTE: add metadata so wallets show your app name (avoid "Unknown app")
-    const client = await SignClient.init({
-      projectId: WALLETCONNECT_PROJECT_ID,
-      metadata: {
-        name: 'Parchi Gate',
-        description: 'Gate Scanner - sign challenges',
-        url: typeof window !== 'undefined' ? window.location.origin : 'https://example.com',
-        icons: [], // optional: add a URL to an icon if you have one
-      },
-    });
-
-    clientRef.current = client;
-
-    // Basic session cleanup listener (existing)
-    client.on?.('session_delete', () => {
-      sessionTopicRef.current = null;
-      setWcStatus('disconnected');
-    });
-
-    // --- Debug listeners (very helpful while debugging pairing/settle) ---
-    // replace the debug listeners block with this:
-    const dbg = (k: string, v?: any) => console.log(`[WC DBG] ${k}`, v);
-client.on?.('session_proposal', (proposal) => console.log('[WC DBG] session_proposal', proposal));
-client.on?.('session_request', (req) => console.log('[WC DBG] session_request', req));
-//client.on?.('session_settle', (session) => console.log('[WC DBG] session_settle', session));
-client.on?.('session_update', (update) => console.log('[WC DBG] session_update', update));
-client.on?.('session_delete', (del) => console.log('[WC DBG] session_delete', del));
-client.on?.('session_event', (ev) => console.log('[WC DBG] session_event', ev));
-client.on?.('session_expire', (exp) => console.log('[WC DBG] session_expire', exp));
-client.on?.('session_ping', (p) => console.log('[WC DBG] session_ping', p));
-
-
-
-    
-    //client.on?.('pairing_create', (p) => dbg('pairing_create', p));
-    //client.on?.('pairing_update', (p) => dbg('pairing_update', p));
-    //client.on?.('pairing_delete', (p) => dbg('pairing_delete', p));
-    client.on?.('session_proposal', (proposal) => dbg('session_proposal', proposal));
-    client.on?.('session_request', (req) => dbg('session_request', req));
-    //client.on?.('session_settle', (session) => dbg('session_settle', session));
-    client.on?.('session_update', (update) => dbg('session_update', update));
-    client.on?.('session_delete', (del) => dbg('session_delete', del));
-    client.on?.('session_ping', (p) => dbg('session_ping', p));
-    client.on?.('session_event', (ev) => dbg('session_event', ev));
-    client.on?.('session_expire', (exp) => dbg('session_expire', exp));
-
-    return client;
-  } finally {
-    // @ts-ignore
-    (window as any).__WALLETCONNECT_CLIENT_INITIALIZING = false;
-  }
-}
-
-
-
-  // start pairing, request sign, return { signature, pubkey }
-  async function startWalletConnectAndSign(messageToSignStr: string) {
-  setBusy(true);
-  setError(null);
-  setSignature(null);
-  setSignerPubkey(null);
-  setWcQrDataUrl(null);
-  setWcStatus('initializing');
-
-  try {
-    const client = await initWalletConnectClient();
-
-    // DEV helper: clear old pairings to avoid stale key usage (only in dev)
-    try {
-      const pairings = client.pairing?.getAll?.() ?? [];
-      if (pairings.length) {
-        console.log('[WC DEV] clearing existing pairings:', pairings.map(p => p.topic));
-        for (const p of pairings) {
-          try {
-            // Note: delete(key, reason) per your SignClient types
-            await client.pairing?.delete?.(p.topic, { code: 6000, message: 'dev_clear' });
-            console.log('[WC DEV] pairing deleted', p.topic);
-          } catch (e) {
-            console.warn('[WC DEV] pairing delete failed for', p.topic, e);
-          }
-        }
-      }
-    } catch (clearErr) {
-      console.warn('[WC DEV] pairing clear err', clearErr);
-    }
-
-
-
-    // compute devnet genesis CAIP
-    const genesis = await getSolanaGenesisHash();
-    console.log('solana genesisHash from RPC:', genesis);
-    const SOLANA_DEVNET_CAIP = `solana:${genesis}`;
-    console.log('Using CAIP chain:', SOLANA_DEVNET_CAIP);
-
-    // include friendly fallback "solana:devnet" for wallets that accept that label
-    const solChain = ensureCaipChain('solana', SOLANA_DEVNET_CAIP);
-    const fallbackChain = 'solana:devnet';
-    const requiredNamespaces = {
-      solana: {
-        methods: ['solana_signMessage'],
-        chains: [solChain, fallbackChain],
-        events: [],
-      },
-    };
-    console.log('WalletConnect proposal (requiredNamespaces):', JSON.stringify(requiredNamespaces, null, 2));
-
-    const { uri, approval } = await client.connect({ requiredNamespaces });
-
-    if (!uri) throw new Error('WalletConnect pairing URI not returned');
-    setWcStatus('paired_waiting');
-
-    // render QR
-    const dataUrl = await QRCode.toDataURL(uri);
-    setWcQrDataUrl(dataUrl);
-
-    // approval timeout (increase while debugging)
-    const APPROVAL_TIMEOUT_MS = 180_000; // 3 minutes while debugging
-    const approvalPromise = approval();
-    const timeoutPromise = new Promise((_res, rej) =>
-      setTimeout(() => rej(new Error('wallet_approval_timeout')), APPROVAL_TIMEOUT_MS)
-    );
-
-    // wait for wallet to accept / settle
-    let session: SessionTypes.Struct;
-    try {
-      session = await Promise.race([approvalPromise, timeoutPromise]) as SessionTypes.Struct;
-    } catch (err) {
-      console.error('approval error / timeout:', err);
-      throw err;
-    }
-
-    console.log('approval returned session:', session);
-    console.log('session.namespaces:', JSON.stringify(session.namespaces, null, 2));
-
-    // defensive: check accepted chains
-    const acceptedChains = (session.namespaces?.solana?.chains ?? []) as string[];
-    console.log('acceptedChains by wallet:', acceptedChains);
-    if (!acceptedChains.includes(solChain) && !acceptedChains.includes(fallbackChain)) {
-      const accepted = acceptedChains.length ? acceptedChains.join(', ') : 'none';
-      setWcStatus('error');
-      setError(`Wallet did not accept requested chain. Wallet accepted: ${accepted}. Please enable Devnet or use a wallet that supports Devnet (Phantom recommended).`);
-      throw new Error('wallet_no_devnet_support');
-    }
-
-    sessionTopicRef.current = session.topic;
-    setWcStatus('connected');
-
-    // ENCODE message properly (utf8 bytes) and also prepare base64 fallback
-  // add bs58 import at top: import bs58 from 'bs58'
-
-// inside startWalletConnectAndSign, after you've validated session and have `session.topic` and `solChain`:
-
-// prepare encodings (use a Uint8Array as canonical source)
-const encoder = new TextEncoder();
-const u8 = encoder.encode(messageToSignStr);               // Uint8Array
-const messageBytes = Array.from(u8);                       // Array<number> -> WalletConnect-friendly
-const messageBase64 = typeof window !== 'undefined'
-  ? btoa(String.fromCharCode(...u8))                       // base64 from bytes
-  : Buffer.from(u8).toString('base64');                    // server-side fallback
-const messageBase58 = bs58.encode(u8);                     // bs58 string
-
-console.log('Prepared message encodings:', {
-  len: u8.length,
-  bytesPreview: messageBytes.slice(0, 10),
-  base64Preview: messageBase64.slice(0, 20),
-  base58Preview: messageBase58.slice(0, 20),
-});
-
-// We'll try variants in order and capture the raw wallet response
-let rawRes: unknown;
-let lastErr: any = null;
-
-// 1) Try bytes (Array<number>)
-try {
-  console.log('Request: solana_signMessage with bytes array');
-  rawRes = await client.request({
-    topic: session.topic,
-    chainId: solChain,
-    request: { method: 'solana_signMessage', params: { message: messageBytes } },
-  } as any);
-  console.log('sign with bytes succeeded', rawRes);
-} catch (err) {
-  lastErr = err;
-  console.warn('sign with bytes failed:', err);
-}
-
-// 2) Try base64 (if bytes failed)
-if (!rawRes) {
-  try {
-    console.log('Request: solana_signMessage with base64');
-    rawRes = await client.request({
-      topic: session.topic,
-      chainId: solChain,
-      request: { method: 'solana_signMessage', params: { message: messageBase64 } },
-    } as any);
-    console.log('sign with base64 succeeded', rawRes);
-  } catch (err) {
-    lastErr = err;
-    console.warn('sign with base64 failed:', err);
-  }
-}
-
-// 3) Try base58 (if previous failed)
-if (!rawRes) {
-  try {
-    console.log('Request: solana_signMessage with base58');
-    rawRes = await client.request({
-      topic: session.topic,
-      chainId: solChain,
-      request: { method: 'solana_signMessage', params: { message: messageBase58 } },
-    } as any);
-    console.log('sign with base58 succeeded', rawRes);
-  } catch (err) {
-    lastErr = err;
-    console.warn('sign with base58 failed:', err);
-  }
-}
-
-if (!rawRes) {
-  // nothing worked — throw the last error (or custom)
-  throw lastErr ?? new Error('All sign variants failed');
-}
-
-
-    setWcStatus('requesting_signature');
-
-    // parse response like before
-    let sig: string | null = null;
-    let pubkey: string | null = null;
-    const isObject = (v: unknown): v is Record<string, unknown> =>
-      typeof v === 'object' && v !== null;
-
-    if (isObject(rawRes) && typeof (rawRes as any).signature === 'string') {
-      sig = (rawRes as any).signature;
-      if (typeof (rawRes as any).pubkey === 'string') pubkey = (rawRes as any).pubkey;
-    }
-
-    if (!sig) {
-      if (typeof rawRes === 'string') sig = rawRes;
-      else if (Array.isArray(rawRes)) {
-        if (typeof rawRes[0] === 'string') sig = rawRes[0];
-        if (typeof rawRes[1] === 'string') pubkey = rawRes[1];
-      } else if (isObject(rawRes)) {
-        if ('result' in rawRes) {
-          const r = (rawRes as any).result;
-          if (typeof r === 'string') sig = r;
-          else if (isObject(r) && typeof r.signature === 'string') {
-            sig = r.signature;
-            if (typeof r.pubkey === 'string') pubkey = r.pubkey;
-          } else if (Array.isArray(r) && typeof r[0] === 'string') {
-            sig = r[0];
-            if (typeof r[1] === 'string') pubkey = r[1];
-          }
-        } else if ('signed' in rawRes && typeof (rawRes as any).signed === 'string') {
-          sig = (rawRes as any).signed;
-          if (typeof (rawRes as any).pubkey === 'string') pubkey = (rawRes as any).pubkey;
-        } else if ('signature' in rawRes && typeof (rawRes as any).signature === 'object') {
-          const s = (rawRes as any).signature;
-          if (typeof s === 'string') sig = s;
-        }
-      }
-    }
-
-    console.log('sign result parsed:', { sig, pubkey });
-    if (!sig) {
-      console.warn('Wallet sign returned unexpected shape:', rawRes);
-      throw new Error('no_signature_in_response');
-    }
-
-    setSignature(sig);
-    if (pubkey) setSignerPubkey(pubkey);
-
-    setWcStatus('signed');
-
-    // disconnect single-use
-    try {
-      await client.disconnect({ topic: session.topic, reason: { code: 6000, message: 'single-use finished' } });
-      sessionTopicRef.current = null;
-      setWcStatus('disconnected');
-    } catch (e) {
-      console.warn('wc disconnect error after sign', e);
-    }
-
-    return { signature: sig, pubkey: pubkey ?? null };
-  } catch (err: any) {
-    console.error('WalletConnect error', err);
-    setError(err?.message ?? 'walletconnect_error');
-    setWcStatus('error');
-    throw err;
-  } finally {
-    setBusy(false);
-  }
-}
-
-// utils/base64url.ts (or inline)
-function base64UrlToUtf8(base64url: string): string {
-  // turn base64url into base64
-  let b64 = base64url.replace(/-/g, '+').replace(/_/g, '/');
-  // add padding
-  while (b64.length % 4) b64 += '=';
-  // decode base64 into binary string
-  const bin = atob(b64);
-  // convert binary string to UTF-8
-  const bytes = Uint8Array.from(bin.split('').map(ch => ch.charCodeAt(0)));
-  const decoder = new TextDecoder('utf-8');
-  return decoder.decode(bytes);
-}
-// // helper: decode base64url -> utf8
-// function base64UrlToUtf8(base64url: string): string {
-//   let b64 = base64url.replace(/-/g, '+').replace(/_/g, '/');
-//   while (b64.length % 4) b64 += '=';
-//   const bin = atob(b64);
-//   const bytes = Uint8Array.from(bin.split('').map(ch => ch.charCodeAt(0)));
-//   return new TextDecoder('utf-8').decode(bytes);
-// }
-
-/**
- * Normalize scanned QR text into a JSON-string that /api/gate/scan understands.
- * Accepts:
- *  - raw JSON string already ({"t": "...", "m": "..."})
- *  - "parchi:<base64url>" format (decodes and maps short keys)
- */
-function normalizeQrStringForServer(raw: string): string {
-  const s = raw.trim();
-  // handle parchi:<base64url>
-  if (s.startsWith('parchi:')) {
-    const payload = s.slice('parchi:'.length);
-    try {
-      const jsonText = base64UrlToUtf8(payload);
-      const obj = JSON.parse(jsonText);
-      // map short keys to server keys — send mint as `m`
-      const mapped = {
-        // keep fallback to existing names if generator already used them
-        m: obj.a ?? obj.m ?? obj.mintPubkey ?? null,
-        e: obj.e ?? obj.eventId ?? null,
-        // t might be numeric ticketNumber — we still send it, server will use mint first
-        t: obj.t ?? obj.ticketId ?? null,
-        ts: obj.ts ?? null,
-        c: obj.c ?? null,
-      };
-      return JSON.stringify(mapped);
-    } catch (err) {
-      // fallback: return original string so server can still try to parse/handle it
-      return s;
-    }
-  }
-
-  // already JSON or other: pass through
-  return s;
-}
-
-function normalizeQrString(raw: string): string {
-  const s = raw.trim();
-  if (s.startsWith('parchi:')) {
-    const payload = s.slice('parchi:'.length);
-    try {
-      const jsonText = base64UrlToUtf8(payload);
-      // return JSON text that the server can parse
-      return jsonText;
-    } catch (err) {
-      // fallback: return original to let server error out with details
-      return s;
-    }
-  }
-  return s;
-}
-
   // --- Top-level flow: when a QR is scanned (camera or manual) ---
   const handleScan = useCallback(async (text: string) => {
-  const normalized = normalizeQrStringForServer(text);
-    if (!normalized) return;
-    if (normalized === lastScan) return; // avoid duplicates
-    setLastScan(normalized);
+    const normalizedForServer = normalizeQrStringForServer(text);
+    if (!normalizedForServer) return;
+    if (normalizedForServer === lastScan) return; // avoid duplicates
+    setLastScan(normalizedForServer);
     setStatus('processing');
     setMessage('Verifying ticket...');
 
     try {
-      // 1) call backend scan to get challenge after decoding the qr text
-      const normalized = normalizeQrString(text);
-      console.log('Normalized QR string for scan:', normalized);
-         const scanData = await callScanApi(normalized);
+      // 1) call backend scan to parse QR & prepare verification (DB lookup)
+      const scanData = await callScanApi(normalizedForServer);
 
-      //  await callScanApi(normalized);
-
-      // 2) get message to sign
-      if (!scanData.messageToSign || !scanData.challengeJwt) {
-        throw new Error('Invalid scan response');
+      // 2) server should return verificationId or ticketId which we use to verify
+      const vid = scanData.verificationId ?? null;
+      const tid = scanData.ticketId ?? null;
+      if (!vid && !tid) {
+        throw new Error('No verification ID or ticket ID returned from scan');
       }
 
-      // set UI debug info
-      setChallengeJwt(scanData.challengeJwt);
-      setMessageToSign(scanData.messageToSign);
-      setVerificationId(scanData.verificationId ?? null);
-      setExpiresIn(scanData.expiresInSeconds ?? null);
-      setTicketId(scanData.ticketId ?? null);
-
-      // 3) request wallet sign via WalletConnect (Phantom)
-      const signRes = await startWalletConnectAndSign(scanData.messageToSign);
-
-      // 4) call verify api with signature
+      // 3) call verify endpoint (server will check DB / ownership / NFT)
       const verify = await callVerifyApi({
-        challengeJwt: scanData.challengeJwt,
-        signatureBase58: signRes.signature,
-        signerPubkey: signRes.pubkey ?? undefined,
+        verificationId: vid ?? undefined,
+        ticketId: tid ?? undefined,
         staffId: STAFF_ID,
         gateId: GATE_ID,
-        verificationId: scanData.verificationId ?? undefined,
       });
 
-      // 5) show success or error
+      // 4) show success or error based on response
       if (verify.ok) {
         setStatus('success');
-        setMessage(`Entry granted • Ticket ID ${verify.ticketId ?? scanData.ticketId ?? ''}`);
+        setMessage(`Entry granted • Ticket ${verify.ticketId ?? tid ?? ''}`);
         setVerifyResult(verify);
       } else {
         setStatus('error');
@@ -625,40 +198,18 @@ function normalizeQrString(raw: string): string {
     setStatus('idle');
     setMessage('Scan a ticket QR to verify');
     setManualText('');
-    setChallengeJwt(null);
-    setMessageToSign(null);
-    setExpiresIn(null);
     setVerificationId(null);
     setTicketId(null);
-    setWcQrDataUrl(null);
-    setWcStatus(null);
-    setSignature(null);
-    setSignerPubkey(null);
+    setEventId(null);
     setVerifyResult(null);
     setError(null);
   }
-
-  // countdown for expiresIn (UI only)
-  useEffect(() => {
-    if (!expiresIn) return;
-    let remaining = expiresIn;
-    setWcStatus((s) => s ?? 'challenge_issued');
-    const iv = setInterval(() => {
-      remaining -= 1;
-      if (remaining <= 0) {
-        setWcStatus('challenge_expired');
-        clearInterval(iv);
-      }
-    }, 1000);
-    return () => clearInterval(iv);
-  }, [expiresIn]);
 
   return (
     <div className="min-h-screen bg-black py-8">
       <div className="max-w-4xl mx-auto px-4 space-y-6">
         <div className="flex items-center justify-between">
           <h1 className="text-xl font-semibold text-white">Gate Scanner</h1>
-          <WalletConnectButton />
         </div>
 
         <Card className="bg-white/5 border-white/10">
@@ -667,9 +218,7 @@ function normalizeQrString(raw: string): string {
             <div className="aspect-square bg-black/60 rounded-lg overflow-hidden flex items-center justify-center">
               <QRScanner
                 onResult={(text) => {
-                  // QRScanner might call rapidly, so debounce via lastScan check
                   handleScan(text).catch((e) => {
-                    // handled in handleScan
                     console.warn('handleScan error', e);
                   });
                 }}
@@ -683,7 +232,7 @@ function normalizeQrString(raw: string): string {
               />
             </div>
 
-            {/* right: status + manual + walletconnect */}
+            {/* right: status + manual */}
             <div className="flex flex-col items-center justify-center text-center space-y-3 p-4">
               {status === 'success' && <CheckCircle className="w-12 h-12 text-emerald-400" />}
               {status === 'error' && <AlertCircle className="w-12 h-12 text-red-400" />}
@@ -719,31 +268,27 @@ function normalizeQrString(raw: string): string {
                 </div>
               </div>
 
-              {/* WalletConnect QR & debug info */}
               <div className="w-full pt-2">
                 <div className="min-h-[180px] border border-white/5 rounded p-3 flex flex-col items-center justify-center">
-                  {wcQrDataUrl ? (
-                    <>
-                      <img src={wcQrDataUrl} alt="WalletConnect QR" style={{ width: 200, height: 200 }} />
-                      <div className="text-sm text-white/70 mt-2">Status: {wcStatus}</div>
-                    </>
-                  ) : (
-                    <div className="text-white/50">WalletConnect QR will appear here after scan request.</div>
-                  )}
+                  <div className="text-white/50">Scan result & verification live status</div>
                 </div>
 
                 <div className="mt-3 text-left text-xs text-white/70">
-                  <div>Challenge expires in: {expiresIn ?? '—'}s</div>
                   <div>Ticket: {ticketId ?? '—'}</div>
                   <div>VerificationId: {verificationId ?? '—'}</div>
-                  <div>Signature: {signature ? <span className="break-words">{signature}</span> : '—'}</div>
-                  <div>Signer: {signerPubkey ?? '—'}</div>
+                  <div>Event: {eventId ?? '—'}</div>
                 </div>
 
                 <div className="mt-3">
                   <div className="text-left text-sm text-white/80">Verify result:</div>
                   <pre className="text-xs text-white/70 max-h-36 overflow-auto p-2 bg-white/2 rounded mt-2">{JSON.stringify(verifyResult, null, 2)}</pre>
                 </div>
+
+                {error && (
+                  <div className="mt-2 text-sm text-red-400">
+                    Error: {error}
+                  </div>
+                )}
               </div>
             </div>
           </CardContent>
